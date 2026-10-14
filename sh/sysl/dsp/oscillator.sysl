@@ -1,0 +1,105 @@
+module sh.sysl.dsp
+
+// A phase-accumulator oscillator.
+//
+// The phase is a `u32q32` that wraps: one cycle is the whole range of the type, the step per sample
+// is `freq / rate` held to 2^-32, and the wrap at the end of a cycle is the `wrapping` addition doing
+// what it does, with no comparison. Every shape is read off the phase's bits in `q31`, so the
+// generator is the same integer code for every sample type and only the last conversion differs.
+//
+// **The sine is a 257-entry `q15` table and a linear interpolation between neighbours.** The table
+// is computed by a `const` function while compiling, so it is constant data (`.rodata` on a board)
+// and identical on every machine; the 257th entry repeats the first, so the interpolation never
+// wraps an index. The top eight bits of the phase choose the entry and the next fifteen the
+// position between it and the next.
+
+/** A phase: one cycle is the whole of a `u32q32`, and adding past the end wraps. */
+type Phase = new u32q32 wrapping
+
+/** The waveform an oscillator produces. */
+enum Shape
+    Sine
+    Saw
+    Square
+    Triangle
+
+private const pi: real = 3.141592653589793
+
+// sin(x) on [-pi, pi], by its series to x^15: past the last term the error is below a q15 unit.
+private const series_sine(x: real) -> real
+    var term = x
+    var sum = x
+
+    for k in 1..<8
+        term = -term * x * x / real((2 * k) * (2 * k + 1))
+        sum += term
+
+    sum
+end series_sine
+
+private const sine_table() -> [257]q15
+    var t: [257]q15 = [q15(0.0); 257]
+
+    for i in 0..<257
+        var x = 2.0 * pi * real(i) / 256.0
+
+        if x > pi then x -= 2.0 * pi
+
+        t[i] = q15(series_sine(x))
+
+    t
+end sine_table
+
+/** One cycle of a sine, 256 steps and the first repeated, as `q15`. */
+val SINE: [257]q15 = sine_table()
+
+private sine_at(bits: u32) -> q31
+    val i = usize(bits >> 24)
+    val f = q15::Bits(i16((bits >> 9) & 0x7FFF))
+    val d = SINE[i + 1] - SINE[i]
+
+    q31(SINE[i]) + d * f
+
+private triangle_at(bits: u32) -> q31
+    val b = i64(bits)
+    val v = if b < 2147483648 then 2 * b - 2147483648 else 6442450944 - 2 * b
+
+    q31::Bits(i32(if v < 2147483647 then v else 2147483647))
+
+/** An oscillator producing `shape` at a fixed frequency. */
+struct Oscillator[S: Sample]
+    shape: Shape
+    phase: Phase
+    inc: Phase
+
+    /** An oscillator at `freq` Hz for a sample rate of `rate`, starting at phase zero, or
+     * `BadFrequency` unless `0 <= freq < rate / 2`.
+     */
+    of(shape: Shape, freq: real, rate: real) -> Result[Oscillator[S], Fault]
+        if rate <= 0.0 then return Err(BadParameter)
+        if freq < 0.0 || freq >= rate / 2.0 then return Err(BadFrequency)
+
+        Ok(Oscillator(shape, Phase(0.0), Phase(u32q32(freq / rate))))
+    end of
+
+    /** The next sample. */
+    @no_alloc
+    next(*self) -> S
+        val bits = self.phase.bits
+
+        val v = self.shape match
+            Sine -> sine_at(bits)
+            Saw -> q31::Bits(i32(i64(bits) - 2147483648))
+            Square -> if bits < 2147483648 then q31::Max else q31::Min
+            Triangle -> triangle_at(bits)
+
+        self.phase += self.inc
+        S.from_q31(v)
+    end next
+
+    /** Fills `out` with the next `out.len` samples. */
+    @no_alloc
+    process(*self, out: []S)
+        for i in 0..<out.len
+            out[i] = self.next()
+end Oscillator

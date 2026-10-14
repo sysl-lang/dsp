@@ -1,0 +1,97 @@
+module sh.sysl.dsp
+
+// An ADSR envelope whose stages last exactly the number of samples they were given.
+//
+// Each level is computed from the stage's endpoints and the count of samples into it --
+// `from + (to - from) * k / n` in integers -- rather than by adding a step per sample, so no error
+// accumulates and the last sample of a stage is its endpoint exactly: an attack of `n` samples
+// reaches full scale on its `n`th sample, and a release of `n` reaches zero on its `n`th.
+
+/** Where an envelope is. */
+enum Stage
+    Idle
+    Attack
+    Decay
+    Sustain
+    Release
+
+/** A linear attack-decay-sustain-release envelope; lengths are in samples. */
+struct Adsr[S: Sample]
+    attack: int
+    decay: int
+    sustain: q31
+    release: int
+    now: Stage
+    k: int
+    from: q31
+    level: q31
+
+    /** An envelope, or `BadParameter` for a negative length or a sustain level outside 0..1. A
+     * sustain of 1 is full scale, the largest value a `q31` holds.
+     */
+    of(attack: int, decay: int, sustain: real, release: int) -> Result[Adsr[S], Fault]
+        if attack < 0 || decay < 0 || release < 0 then return Err(BadParameter)
+        if sustain < 0.0 || sustain > 1.0 then return Err(BadParameter)
+
+        val zero = q31(0.0)
+
+        Ok(Adsr(attack, decay, q31(sustain), release, Idle, 0, zero, zero))
+    end of
+
+    /** The key goes down: the attack starts from wherever the level is. */
+    gate_on(*self) = self.enter(Attack)
+
+    /** The key comes up: the release starts from wherever the level is. */
+    gate_off(*self) = self.enter(Release)
+
+    /** Where the envelope is now. */
+    stage(self) -> Stage = self.now
+
+    private enter(*self, stage: Stage)
+        self.now = stage
+        self.k = 0
+        self.from = self.level
+
+        // A stage of no length is over as soon as it begins.
+        stage match
+            Attack -> if self.attack == 0 then
+                self.level = q31::Max
+                self.enter(Decay)
+            Decay -> if self.decay == 0 then
+                self.level = self.sustain
+                self.enter(Sustain)
+            Release -> if self.release == 0 then
+                self.level = q31(0.0)
+                self.enter(Idle)
+            _ -> ()
+    end enter
+
+    // One more sample into a ramp of `n` towards `to`; at the last one the stage is `next`.
+    private ramp(*self, to: q31, n: int, next: Stage)
+        self.k += 1
+
+        val a = i64(self.from.bits)
+
+        self.level = q31::Bits(i32(a + (i64(to.bits) - a) * i64(self.k) / i64(n)))
+
+        if self.k == n then self.enter(next)
+    end ramp
+
+    /** The next level, as a sample. */
+    @no_alloc
+    next(*self) -> S
+        self.now match
+            Attack -> self.ramp(q31::Max, self.attack, Decay)
+            Decay -> self.ramp(self.sustain, self.decay, Sustain)
+            Release -> self.ramp(q31(0.0), self.release, Idle)
+            _ -> ()
+
+        S.from_q31(self.level)
+    end next
+
+    /** `input` shaped by the envelope into the first `input.len` samples of `out`. */
+    @no_alloc
+    process(*self, input: []const S, out: []S)
+        for i in 0..<input.len
+            out[i] = input[i] * self.next()
+end Adsr

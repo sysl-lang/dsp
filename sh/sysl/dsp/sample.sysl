@@ -1,0 +1,184 @@
+module sh.sysl.dsp
+
+import sysl.math.Float
+import sysl.math.Signed
+
+// What a sample has to be for a block to process it, and the three types that are one.
+//
+// Every block in this package is written once, against `Sample`, and runs at `q15`, `q31` and
+// `f32` unchanged. What differs between the three is not the arithmetic a block wants -- every
+// block wants "multiply a coefficient by a sample and add it to a running sum" -- but **where that
+// sum lives**, and that is the one decision this file makes per type.
+//
+// **The accumulator is an associated type, and for the fixed-point samples it is exact.** A
+// coefficient is wider-ranged than a sample: a biquad's `a1` approaches 2 and a shelf's `b0` passes
+// it, so a coefficient is an `i32q28` (-8 to just under 8) whatever the sample is. A `q15` times an
+// `i32q28` is exactly an `i48q43`, and a `q31` times one exactly an `i64q59`, so the accumulator is
+// that format held in 64 bits and made `wrapping`: every product goes in without rounding, an
+// overflow partway through a sum cancels when the sum comes back into range, and the one rounding
+// is the conversion back to a sample, which saturates. For `f32` the accumulator is `f32` itself.
+//
+// Nothing here needed a language feature of its own: the mixed-format product takes its format from
+// the accumulator it is added into, and `S::Acc` / `S::Coef` are ordinary associated types.
+
+/** The accumulator a `q15` sample's products are summed in: `q15 × i32q28` is exactly an `i48q43`. */
+type Acc15 = new i64q43 wrapping
+
+/** The accumulator a `q31` sample's products are summed in: `q31 × i32q28` is exactly an `i64q59`. */
+type Acc31 = new i64q59 wrapping
+
+/** A `q15` dot product of pairs, two lanes at a time: `q15 × q15` is exactly an `i32q30`, and a
+ * wrapping 32-bit sum of those is what `SMLAD` computes on a core with Arm's DSP extension.
+ */
+type Dot15 = new i32q30 wrapping
+
+/** A `q31` dot product: `q31 × q31` is exactly an `i64q62`. */
+type Dot31 = new i64q62 wrapping
+
+/** A sample type every block in this package processes.
+ *
+ * `Coef` is a coefficient or a gain -- for the fixed-point samples an `i32q28`, which holds -8 up to
+ * just under 8 -- and `Acc` is where a coefficient times a sample is summed without rounding.
+ */
+trait Sample: Zero + Add + Sub + Mul + Neg + Ord + Eq
+    type Coef
+    type Acc: Add
+
+    /** The nearest sample to `x`, saturating at the type's range (a fixed-point sample holds -1 up
+     * to just under 1; an `f32` holds whatever it is given).
+     */
+    from_real(x: real) -> Self
+
+    /** The value, exactly where `real` holds it (every `q15` and `q31` does). */
+    to_real(self) -> real
+
+    /** The nearest sample to a `q31`, which is how a generator in this package hands over its value. */
+    from_q31(x: q31) -> Self
+
+    /** Whether `x` is inside the range a coefficient holds -- `coef` saturates outside it. */
+    coef_fits(x: real) -> bool
+
+    /** The nearest coefficient to `x`, saturating. */
+    coef(x: real) -> Self::Coef
+
+    acc_zero() -> Self::Acc
+
+    /** `acc + c * x`, the product exact. */
+    mac(acc: Self::Acc, c: Self::Coef, x: Self) -> Self::Acc
+
+    /** The sample nearest a sum, saturating at the type's range for a fixed-point sample and unchanged
+     * for an `f32` -- what a filter's output is.
+     */
+    narrow(acc: Self::Acc) -> Self
+
+    /** What rounding `acc` to a sample drops, saturation aside: at most half a unit of the sample,
+     * either way, and zero for an `f32`, whose sum is not rounded. A filter carries it into the next
+     * sum, so the rounding errors cancel rather than settle into an offset.
+     */
+    residual(acc: Self::Acc) -> Self::Acc
+
+    /** The sample nearest a sum, clipped to -1..1 for every type -- what a gain or a mix produces. */
+    clip(acc: Self::Acc) -> Self
+
+    /** `|x|`, saturating: the magnitude of a fixed-point type's most negative value is its largest. */
+    level(self) -> Self
+
+    /** `Σ taps[k] * xs[k]` over `taps.len` terms, exact until the one rounding into a sample.
+     *
+     * For the fixed-point samples the sum is held in a wrapping accumulator of twice the sample's
+     * width, so the true result has to lie within -2..2 for the answer to be right: taps whose
+     * magnitudes sum to less than 2 guarantee it.
+     */
+    dot(taps: []const Self, xs: []const Self) -> Self
+
+impl Sample for q15
+    type Coef = i32q28
+    type Acc = Acc15
+
+    from_real(x: real) -> q15 = q15(x)
+    to_real(self) -> real = real(self)
+    from_q31(x: q31) -> q15 = q15(x)
+    coef_fits(x: real) -> bool = x >= -8.0 && x < 8.0
+    coef(x: real) -> i32q28 = i32q28(x)
+    acc_zero() -> Acc15 = Acc15(0.0)
+    mac(acc: Acc15, c: i32q28, x: q15) -> Acc15 = acc + c * x
+    narrow(acc: Acc15) -> q15 = q15(acc)
+    residual(acc: Acc15) -> Acc15 = Acc15(i64q43::Bits(below_unit(acc.bits)))
+    clip(acc: Acc15) -> q15 = q15(acc)
+    level(self) -> q15 = self.abs()
+
+    // Two lanes at a time, so that on a Cortex-M4 each step is `LDR`, `LDR`, `SMLAD`.
+    dot(taps: []const q15, xs: []const q15) -> q15
+        var acc = Dot15(0.0)
+        var i: usize = 0
+
+        while i + 2 <= taps.len
+            val t: <2>q15 = taps.load(i)
+            val x: <2>q15 = xs.load(i)
+
+            acc += (t * x).sum()
+            i += 2
+
+        if i < taps.len then acc += taps[i] * xs[i]
+
+        q15(acc)
+    end dot
+
+impl Sample for q31
+    type Coef = i32q28
+    type Acc = Acc31
+
+    from_real(x: real) -> q31 = q31(x)
+    to_real(self) -> real = real(self)
+    from_q31(x: q31) -> q31 = x
+    coef_fits(x: real) -> bool = x >= -8.0 && x < 8.0
+    coef(x: real) -> i32q28 = i32q28(x)
+    acc_zero() -> Acc31 = Acc31(0.0)
+    mac(acc: Acc31, c: i32q28, x: q31) -> Acc31 = acc + c * x
+    narrow(acc: Acc31) -> q31 = q31(acc)
+    residual(acc: Acc31) -> Acc31 = Acc31(i64q59::Bits(below_unit(acc.bits)))
+    clip(acc: Acc31) -> q31 = q31(acc)
+    level(self) -> q31 = self.abs()
+
+    dot(taps: []const q31, xs: []const q31) -> q31
+        var acc = Dot31(0.0)
+
+        for i in 0..<taps.len
+            acc += taps[i] * xs[i]
+
+        q31(acc)
+
+impl Sample for f32
+    type Coef = f32
+    type Acc = f32
+
+    from_real(x: real) -> f32 = f32(x)
+    to_real(self) -> real = real(self)
+    from_q31(x: q31) -> f32 = f32(x)
+    coef_fits(x: real) -> bool = true
+    coef(x: real) -> f32 = f32(x)
+    acc_zero() -> f32 = 0.0
+    mac(acc: f32, c: f32, x: f32) -> f32 = acc + c * x
+    narrow(acc: f32) -> f32 = acc
+    residual(acc: f32) -> f32 = 0.0
+    level(self) -> f32 = self.abs()
+
+    clip(acc: f32) -> f32
+        if acc > 1.0 then return 1.0
+        if acc < -1.0 then return -1.0
+        acc
+
+    dot(taps: []const f32, xs: []const f32) -> f32
+        var acc: f32 = 0.0
+
+        for i in 0..<taps.len
+            acc += taps[i] * xs[i]
+
+        acc
+
+// The bits of an accumulator below a sample's unit, signed so that they are what rounding half up
+// drops: both accumulators sit 28 fractional bits below their sample (q43 over q15, q59 over q31).
+private below_unit(bits: i64) -> i64
+    val low = bits & 0xFFFFFFF
+
+    if low >= 0x8000000 then low - 0x10000000 else low

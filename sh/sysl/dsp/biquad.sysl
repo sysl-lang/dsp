@@ -1,0 +1,172 @@
+module sh.sysl.dsp
+
+import sysl.math.Float
+
+// A second-order section, and the RBJ cookbook's designs for it.
+//
+// The design is done in `real` and only then quantized to the sample type, because a coefficient
+// computed in `q15` arithmetic would carry the rounding of every step that formed it. The filter is
+// the transposed direct form II, one body for all three sample types -- and for the fixed-point ones
+// that body computes **what direct form I computes**, bit for bit. Each state is a sum of exact
+// products held in the wrapping accumulator, so
+//
+//     y[n] = round(b0 x[n] + b1 x[n-1] + b2 x[n-2] - a1 y[n-1] - a2 y[n-2] + e[n-1])
+//
+// with one rounding per output sample, which is the property direct form I is chosen for in fixed
+// point. `e` is the part of the previous sum that rounding dropped (`Sample.residual`), carried into
+// the next one: first-order error feedback. Without it the rounding error is amplified by the
+// feedback path's gain at DC, `1 / (1 + a1 + a2)` -- 1486 for a 200 Hz high-pass at 48 kHz -- and a
+// `q15` filter settles hundreds of units away from where it should; with it, the error's spectrum
+// has a zero at DC. The test suite checks the two forms against each other sample by sample.
+
+/** A biquad's five coefficients, normalized so that `a0` is 1, as the cookbook designs them. */
+struct Coefficients
+    b0: real
+    b1: real
+    b2: real
+    a1: real
+    a2: real
+
+/** The quantities every cookbook design starts from: `cos w0` and `alpha`. */
+private struct Prewarp
+    cos_w0: real
+    alpha: real
+
+private prewarp(freq: real, rate: real, q: real) -> Result[Prewarp, Fault]
+    if rate <= 0.0 || q <= 0.0 then return Err(BadParameter)
+    if freq <= 0.0 || freq >= rate / 2.0 then return Err(BadFrequency)
+
+    val w0 = 2.0 * real.pi() * freq / rate
+
+    Ok(Prewarp(w0.cos(), w0.sin() / (2.0 * q)))
+
+private normalized(b0: real, b1: real, b2: real, a0: real, a1: real, a2: real) -> Coefficients =
+    Coefficients(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+
+/** A second-order low-pass at `freq` Hz. */
+low_pass(freq: real, rate: real, q: real) -> Result[Coefficients, Fault]
+    val p = prewarp(freq, rate, q)?
+    val c = p.cos_w0
+
+    Ok(normalized((1.0 - c) / 2.0, 1.0 - c, (1.0 - c) / 2.0, 1.0 + p.alpha, -2.0 * c, 1.0 - p.alpha))
+
+/** A second-order high-pass at `freq` Hz. */
+high_pass(freq: real, rate: real, q: real) -> Result[Coefficients, Fault]
+    val p = prewarp(freq, rate, q)?
+    val c = p.cos_w0
+
+    Ok(normalized((1.0 + c) / 2.0, -(1.0 + c), (1.0 + c) / 2.0, 1.0 + p.alpha, -2.0 * c, 1.0 - p.alpha))
+
+/** A band-pass centred on `freq` Hz with a peak gain of 0 dB. */
+band_pass(freq: real, rate: real, q: real) -> Result[Coefficients, Fault]
+    val p = prewarp(freq, rate, q)?
+
+    Ok(normalized(p.alpha, 0.0, -p.alpha, 1.0 + p.alpha, -2.0 * p.cos_w0, 1.0 - p.alpha))
+
+/** A notch at `freq` Hz. */
+notch(freq: real, rate: real, q: real) -> Result[Coefficients, Fault]
+    val p = prewarp(freq, rate, q)?
+    val c = p.cos_w0
+
+    Ok(normalized(1.0, -2.0 * c, 1.0, 1.0 + p.alpha, -2.0 * c, 1.0 - p.alpha))
+
+/** A peaking equalizer: `gain_db` at `freq` Hz, unity far from it. */
+peaking(freq: real, rate: real, q: real, gain_db: real) -> Result[Coefficients, Fault]
+    val p = prewarp(freq, rate, q)?
+    val a = 10.0.pow(gain_db / 40.0)
+    val c = p.cos_w0
+
+    Ok(normalized(1.0 + p.alpha * a, -2.0 * c, 1.0 - p.alpha * a, 1.0 + p.alpha / a, -2.0 * c,
+        1.0 - p.alpha / a))
+end peaking
+
+/** A low shelf: `gain_db` below `freq` Hz, unity above it. */
+low_shelf(freq: real, rate: real, q: real, gain_db: real) -> Result[Coefficients, Fault]
+    val p = prewarp(freq, rate, q)?
+    val a = 10.0.pow(gain_db / 40.0)
+    val c = p.cos_w0
+    val k = 2.0 * a.sqrt() * p.alpha
+
+    Ok(normalized(a * ((a + 1.0) - (a - 1.0) * c + k), 2.0 * a * ((a - 1.0) - (a + 1.0) * c),
+        a * ((a + 1.0) - (a - 1.0) * c - k), (a + 1.0) + (a - 1.0) * c + k,
+        -2.0 * ((a - 1.0) + (a + 1.0) * c), (a + 1.0) + (a - 1.0) * c - k))
+end low_shelf
+
+/** A high shelf: `gain_db` above `freq` Hz, unity below it. */
+high_shelf(freq: real, rate: real, q: real, gain_db: real) -> Result[Coefficients, Fault]
+    val p = prewarp(freq, rate, q)?
+    val a = 10.0.pow(gain_db / 40.0)
+    val c = p.cos_w0
+    val k = 2.0 * a.sqrt() * p.alpha
+
+    Ok(normalized(a * ((a + 1.0) + (a - 1.0) * c + k), -2.0 * a * ((a - 1.0) + (a + 1.0) * c),
+        a * ((a + 1.0) + (a - 1.0) * c - k), (a + 1.0) - (a - 1.0) * c + k,
+        2.0 * ((a - 1.0) - (a + 1.0) * c), (a + 1.0) - (a - 1.0) * c - k))
+end high_shelf
+
+/** A second-order section over samples of type `S`, its coefficients quantized to `S::Coef`.
+ *
+ * The feedback coefficients are held negated, so every step of the recurrence is one
+ * multiply-accumulate.
+ */
+struct Biquad[S: Sample]
+    b0: S::Coef
+    b1: S::Coef
+    b2: S::Coef
+    na1: S::Coef
+    na2: S::Coef
+    z1: S::Acc
+    z2: S::Acc
+
+    /** A filter with the designed coefficients and silent state, or `CoefficientRange` where one of
+     * them is outside what `S::Coef` holds.
+     */
+    of(c: Coefficients) -> Result[Biquad[S], Fault]
+        val all: [5]real = [c.b0, c.b1, c.b2, c.a1, c.a2]
+
+        for x in all
+            if !S.coef_fits(x) then return Err(CoefficientRange)
+
+        Ok(Biquad(S.coef(c.b0), S.coef(c.b1), S.coef(c.b2), S.coef(-c.a1), S.coef(-c.a2),
+            S.acc_zero(), S.acc_zero()))
+    end of
+
+    /** The filter's response to one sample. */
+    @no_alloc
+    step(*self, x: S) -> S
+        val acc = S.mac(self.z1, self.b0, x)
+        val y = S.narrow(acc)
+
+        self.z1 = S.mac(S.mac(self.z2 + S.residual(acc), self.b1, x), self.na1, y)
+        self.z2 = S.mac(S.mac(S.acc_zero(), self.b2, x), self.na2, y)
+        y
+    end step
+
+    /** Filters `input` into the first `input.len` samples of `out`. */
+    @no_alloc
+    process(*self, input: []const S, out: []S)
+        // Worked on in a local copy, so the state stays in registers: as far as the code generator
+        // knows, a store into `out` could be a store into the filter, and would make it reload
+        // every coefficient and both states on every sample.
+        var f = *self
+
+        for i in 0..<input.len
+            out[i] = f.step(input[i])
+
+        *self = f
+
+    /** Filters `buf` where it lies. */
+    @no_alloc
+    process_in_place(*self, buf: []S)
+        var f = *self
+
+        for i in 0..<buf.len
+            buf[i] = f.step(buf[i])
+
+        *self = f
+
+    /** Silence: the state as it was when the filter was made. */
+    reset(*self)
+        self.z1 = S.acc_zero()
+        self.z2 = S.acc_zero()
+end Biquad

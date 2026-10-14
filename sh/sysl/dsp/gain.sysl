@@ -1,0 +1,44 @@
+module sh.sysl.dsp
+
+import sysl.math.Float
+
+// Gain and mixing, clipped at full scale.
+//
+// A fixed-point sample cannot hold 1.0, so unity gain is not a sample: it is a coefficient, and so
+// is every other gain. The product goes into the exact accumulator and comes back out through
+// `S.clip`, which for a fixed-point sample saturates at the type's ends -- never wrapping round to the
+// other sign -- and for an `f32` clamps to -1..1.
+
+/** A fixed gain. */
+struct Gain[S: Sample]
+    g: S::Coef
+
+    /** A gain of `g` (a linear factor), or `CoefficientRange` where `S::Coef` cannot hold it. */
+    of(g: real) -> Result[Gain[S], Fault]
+        if !S.coef_fits(g) then return Err(CoefficientRange)
+
+        Ok(Gain(S.coef(g)))
+
+    /** A gain of `db` decibels. */
+    db(db: real) -> Result[Gain[S], Fault] = Gain.of(10.0.pow(db / 20.0))
+
+    /** `input` scaled into the first `input.len` samples of `out`, clipped. */
+    @no_alloc
+    process(*self, input: []const S, out: []S)
+        for i in 0..<input.len
+            out[i] = S.clip(S.mac(S.acc_zero(), self.g, input[i]))
+end Gain
+
+/** `a + b` into the first `a.len` samples of `out`, clipped at full scale. */
+@no_alloc
+mix[S: Sample](a: []const S, b: []const S, out: []S)
+    val unity = S.coef(1.0)
+
+    for i in 0..<a.len
+        out[i] = S.clip(S.mac(S.mac(S.acc_zero(), unity, a[i]), unity, b[i]))
+
+/** `ga * a + gb * b` into the first `a.len` samples of `out`, clipped at full scale. */
+@no_alloc
+mix_with[S: Sample](a: []const S, ga: Gain[S], b: []const S, gb: Gain[S], out: []S)
+    for i in 0..<a.len
+        out[i] = S.clip(S.mac(S.mac(S.acc_zero(), ga.g, a[i]), gb.g, b[i]))

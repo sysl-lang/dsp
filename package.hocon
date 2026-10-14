@@ -1,0 +1,34 @@
+// Audio DSP for sysl, written once and run at q15, q31 and f32.
+//
+// Biquads with the RBJ cookbook's designs, FIR filters, gain and mixing that clip rather than wrap,
+// a phase-accumulator oscillator, an ADSR envelope, level meters, and the windows that lead into
+// `sh.sysl.fft`. Every block is generic over `Sample`, whose fixed-point implementations sum products
+// exactly in a wrapping accumulator and round once.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       dsp { git = "github.com/sysl-lang/dsp", version = "0.1.0" }
+//     }
+//
+// The coordinate names the package, `dsp`; the module a program imports is `sh.sysl.dsp`.
+
+package {
+  name    = "dsp"
+  version = "0.1.0"
+
+  // Fixed point with `wrapping` accumulators, the `Signed` conformance a fixed-point `abs` comes
+  // from, lanes whose dot product lowers to `SMLAD`, and `const` functions that build a whole table
+  // all arrived by 0.1.0-alpha.12.
+  sysl = "0.1.0-alpha.12"
+}
+
+// `fft` is here for the test suite only, which transforms a windowed block to check the path into
+// it; the package's own files import nothing from it.
+dependencies {
+  fft { git = "github.com/sysl-lang/fft", version = "0.1.0" }
+}
+
+// **No `heap`.** Every block keeps its state in its own fields, and anything longer -- an FIR's
+// delay line, the complex buffer a spectrum is taken in -- is storage the caller passes, so the
+// package runs on a board with no allocator at all.

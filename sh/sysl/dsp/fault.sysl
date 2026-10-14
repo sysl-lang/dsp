@@ -1,0 +1,25 @@
+module sh.sysl.dsp
+
+/** Why a block could not be built from what it was given. Every refusal is at construction: once a
+ * block exists, processing it cannot fail.
+ */
+enum Fault
+    /** A frequency at or below zero, or at or past half the sample rate. */
+    BadFrequency
+    /** A quality factor, or a sample rate, at or below zero. */
+    BadParameter
+    /** A designed coefficient the sample type's `Coef` cannot hold (fixed point holds -8 to 8). */
+    CoefficientRange
+    /** Storage the caller supplied that is the wrong length for what it is to hold. */
+    BadStorage
+
+impl Display for Fault
+    display(self, out: *Writer, fmt: FormatSpec)
+        val text = self match
+            BadFrequency -> "the frequency is not between zero and half the sample rate"
+            BadParameter -> "a quality factor or a sample rate is not positive"
+            CoefficientRange -> "a coefficient is outside the range the sample type's coefficients hold"
+            BadStorage -> "the storage supplied is the wrong length"
+
+        display_str(text, out, fmt)
+    end display

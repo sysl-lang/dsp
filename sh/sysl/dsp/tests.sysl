@@ -1,0 +1,587 @@
+module sh.sysl.dsp
+@tests
+
+import sysl.math.{Float, Signed}
+import sysl.math.complex.Complex
+import sh.sysl.fft.fft
+
+// What this package claims, run by `sysl test .`.
+//
+// **Nothing here is checked against a value this package produced.** The coefficients and the
+// frequency responses are the RBJ cookbook's formulas and `|H(e^jw)|` worked in numpy; the FIR
+// outputs are numpy's integer `convolve` rounded by hand, so a `q15` or `q31` filter is held to the
+// exact bits; the windows are numpy's `hanning` and `hamming`; the oscillator is held to its
+// zero-crossing count and to a distortion bound measured with `sh.sysl.fft`; the meters to closed
+// forms; the envelope to the sample on which each stage ends.
+//
+// **Every block is run at all three sample types**, since one body serves all three and a body that
+// had quietly come to depend on one of them would pass that section and fail another.
+
+private const fs: real = 48000.0
+
+private near(a: real, b: real, tol: real) -> bool = (a - b).abs() <= tol
+
+private wave(n: int, freq: real, amp: real) -> real = amp * (2.0 * real.pi() * freq * real(n) / fs).sin()
+
+// Whether a construction was refused for `want` -- the blocks are not `Eq`, so the `Result` is not.
+private refused[T](r: Result[T, Fault], want: Fault) -> bool = r match
+    Ok(_) -> false
+    Err(e) -> e == want
+
+// -- coefficients ----------------------------------------------------------------------------------
+
+private same_design(c: Coefficients, want: [5]real) -> bool
+    val got: [5]real = [c.b0, c.b1, c.b2, c.a1, c.a2]
+
+    for i in 0..<5
+        if !near(got[i], want[i], 0.000000000001) then return false
+
+    true
+end same_design
+
+@test("every cookbook design matches the formulas worked in numpy")
+cookbook_designs()
+    assert(same_design(low_pass(1000.0, fs, 0.7071).unwrap(),
+        [0.003916123487156, 0.007832246974313, 0.003916123487156, -1.815339611662529, 0.831004105611155]), "low-pass")
+    assert(same_design(high_pass(200.0, fs, 0.7071).unwrap(),
+        [0.981658097313558, -1.963316194627117, 0.981658097313558, -1.962979747268572, 0.963652641985662]), "high-pass")
+    assert(same_design(band_pass(2000.0, fs, 2.0).unwrap(),
+        [0.060772491707567, 0.0, -0.060772491707567, -1.814448214041583, 0.878455016584866]), "band-pass")
+    assert(same_design(notch(1000.0, fs, 10.0).unwrap(),
+        [0.993516006935253, -1.970032679537168, 0.993516006935253, -1.970032679537168, 0.987032013870507]), "notch")
+    assert(same_design(peaking(1000.0, fs, 1.0, 6.0).unwrap(),
+        [1.043953086990335, -1.895320723936596, 0.867722284759857, -1.895320723936596, 0.911675371750192]), "peak")
+    assert(same_design(low_shelf(300.0, fs, 0.7071, 6.0).unwrap(),
+        [1.009682621099386, -1.952747404635557, 0.945193334780324, -1.953278278902788, 0.954345081612479]), "low shelf")
+    assert(same_design(high_shelf(5000.0, fs, 0.7071, -6.0).unwrap(),
+        [0.584799477300419, -0.564942449152317, 0.199802296507805, -1.236517702900610, 0.456177027556517]), "high shelf")
+end cookbook_designs
+
+@test("a design outside zero to Nyquist, or with no Q, is refused")
+design_refusals()
+    assert(refused(low_pass(0.0, fs, 0.7), BadFrequency), "zero hertz")
+    assert(refused(low_pass(24000.0, fs, 0.7), BadFrequency), "Nyquist itself")
+    assert(refused(high_pass(-5.0, fs, 0.7), BadFrequency), "a negative frequency")
+    assert(refused(peaking(1000.0, fs, 0.0, 6.0), BadParameter), "Q of zero")
+    assert(refused(notch(1000.0, 0.0, 1.0), BadParameter), "no sample rate")
+    assert(str(BadFrequency) == "the frequency is not between zero and half the sample rate", "the rendering")
+
+@test("a coefficient past 8 is refused at fixed point and taken at f32")
+coefficient_range()
+    val c = high_shelf(1000.0, fs, 0.7071, 40.0).unwrap()
+
+    assert(c.b0 > 8.0, "the design really does pass the range")
+
+    val a: Result[Biquad[q15], Fault] = Biquad.of(c)
+    val b: Result[Biquad[q31], Fault] = Biquad.of(c)
+    val f: Result[Biquad[f32], Fault] = Biquad.of(c)
+
+    assert(a.is_err() && b.is_err() && f.is_ok(), "only f32 holds it")
+    assert(refused(a, CoefficientRange), "and the refusal says why")
+end coefficient_range
+
+// -- biquad response -------------------------------------------------------------------------------
+
+// The ratio of output to input RMS for a sine at `freq`, measured over 4800 samples after 4800 to
+// settle -- a whole number of periods of every frequency the tests use, so it is |H| exactly in the
+// steady state, up to the sample type's quantization.
+private response[S: Sample](c: Coefficients, freq: real) -> real
+    val made: Result[Biquad[S], Fault] = Biquad.of(c)
+    var b = made.unwrap()
+    var sx = 0.0
+    var sy = 0.0
+
+    for n in 0..<9600
+        val x = S.from_real(wave(n, freq, 0.25))
+        val y = b.step(x).to_real()
+
+        if n >= 4800 then
+            sx += x.to_real() * x.to_real()
+            sy += y * y
+
+    (sy / sx).sqrt()
+end response
+
+// One design checked at its frequencies against |H| from numpy, at a tolerance per sample type.
+private responds(c: Coefficients, freqs: []const real, want: []const real, name: string)
+    for i in 0..<freqs.len
+        val f = response[f32](c, freqs[i])
+        val q = response[q31](c, freqs[i])
+        val h = response[q15](c, freqs[i])
+
+        assert(near(f, want[i], 0.0005), f"$name at ${freqs[i]} Hz, f32: $f")
+        assert(near(q, want[i], 0.00005), f"$name at ${freqs[i]} Hz, q31: $q")
+        assert(near(h, want[i], 0.003), f"$name at ${freqs[i]} Hz, q15: $h")
+end responds
+
+@test("each design's response at chosen frequencies is |H| at all three sample types")
+biquad_response()
+    responds(low_pass(1000.0, fs, 0.7071).unwrap(), [250.0, 1000.0, 4000.0][..],
+        [0.998061770, 0.707100000, 0.059727910][..], "low-pass")
+    responds(high_pass(200.0, fs, 0.7071).unwrap(), [50.0, 200.0, 4000.0][..],
+        [0.062371558, 0.707100000, 0.999997106][..], "high-pass")
+    responds(band_pass(2000.0, fs, 2.0).unwrap(), [500.0, 2000.0, 8000.0][..],
+        [0.131375134, 1.0, 0.119407521][..], "band-pass")
+    responds(notch(1000.0, fs, 10.0).unwrap(), [1000.0, 500.0][..], [0.0, 0.997793029][..], "notch")
+    responds(peaking(1000.0, fs, 1.0, 6.0).unwrap(), [1000.0, 8000.0][..], [1.995262315, 1.009767965][..],
+        "peak")
+    responds(low_shelf(300.0, fs, 0.7071, 6.0).unwrap(), [50.0, 8000.0][..], [1.994113474, 1.000001015][..],
+        "low shelf")
+    responds(high_shelf(5000.0, fs, 0.7071, -6.0).unwrap(), [16000.0, 200.0][..],
+        [0.501739145, 0.999998328][..], "high shelf")
+end biquad_response
+
+// Direct form I written out as the fixed-point reference page writes it -- five exact products into a
+// wrapping accumulator and one rounding per sample -- with the bits that rounding dropped carried
+// into the next sum.
+private struct DirectOne
+    c: [5]i32q28
+    x1: q31
+    x2: q31
+    y1: q31
+    y2: q31
+    e: Acc31
+
+    step(*self, x: q31) -> q31
+        var acc: Acc31 = self.e
+        acc += self.c[0] * x
+        acc += self.c[1] * self.x1
+        acc += self.c[2] * self.x2
+        acc -= self.c[3] * self.y1
+        acc -= self.c[4] * self.y2
+
+        val y = q31(acc)
+        val b = acc.bits
+
+        self.e = Acc31(i64q59::Bits(b - (((b >> 27) + 1) >> 1 << 28)))
+
+        self.x2 = self.x1
+        self.x1 = x
+        self.y2 = self.y1
+        self.y1 = y
+        y
+    end step
+end DirectOne
+
+@test("the transposed form computes direct form I with error feedback, bit for bit, saturation included")
+same_as_direct_form_one()
+    val c = peaking(1000.0, fs, 1.0, 12.0).unwrap()
+    val made: Result[Biquad[q31], Fault] = Biquad.of(c)
+    var b = made.unwrap()
+    var d = DirectOne([i32q28(c.b0), i32q28(c.b1), i32q28(c.b2), i32q28(c.a1), i32q28(c.a2)], q31(0.0),
+        q31(0.0), q31(0.0), q31(0.0), Acc31(0.0))
+
+    for n in 0..<4000
+        // Loud enough at the peak's frequency that a gain of four saturates the output.
+        val x = q31(wave(n, 1000.0, 0.6) + wave(n, 7000.0, 0.3))
+
+        assert(b.step(x).bits == d.step(x).bits, f"sample $n")
+end same_as_direct_form_one
+
+@test("DC passes a low-pass at unity and is removed by a high-pass")
+biquad_dc()
+    val lp: Result[Biquad[q15], Fault] = Biquad.of(low_pass(1000.0, fs, 0.7071).unwrap())
+    val hp: Result[Biquad[q15], Fault] = Biquad.of(high_pass(200.0, fs, 0.7071).unwrap())
+    var l = lp.unwrap()
+    var h = hp.unwrap()
+    var buf: [2000]q15 = [0.5; 2000]
+    var out: [2000]q15 = [0.0; 2000]
+
+    l.process(buf[..], out[..])
+    assert((out[1999].bits - q15(0.5).bits).abs() <= 1, f"low-pass settles at the input: ${out[1999]}")
+
+    h.process_in_place(buf[..])
+    assert(buf[1999].bits.abs() <= 1, f"high-pass settles at zero: ${buf[1999]}")
+
+    h.reset()
+    val one: [1]q15 = [0.5]
+    var y: [1]q15 = [0.0]
+    h.process(one[..], y[..])
+    assert(y[0] == q15(0.981658097313558 * 0.5), "after a reset the first output is b0 times the input")
+end biquad_dc
+
+@test("an empty block leaves the output alone, and a block of one is one step")
+biquad_edges()
+    val made: Result[Biquad[f32], Fault] = Biquad.of(low_pass(1000.0, fs, 0.7071).unwrap())
+    var b = made.unwrap()
+    val none: [0]f32 = []
+    var out: [1]f32 = [7.0]
+
+    b.process(none[..], out[..])
+    assert(out[0] == 7.0, "nothing written")
+
+    val one: [1]f32 = [1.0]
+    b.process(one[..], out[..])
+    assert(near(real(out[0]), 0.003916123487156, 0.0000001), "b0 times the impulse")
+
+// -- FIR -------------------------------------------------------------------------------------------
+
+private val taps15: [7]i16 = [3277, -6554, 9830, 8192, -4915, 1638, -2458]
+private val x15: [20]i16 = [29157, 8198, 12070, 26031, 5130, 18067, 21866, -18009, -29129, -13097, -14086,
+    24481, 27041, -32423, -14, 21052, -24154, 19468, -24964, -2102]
+
+@test("q15 FIR output is numpy's convolution rounded, bit for bit")
+fir_q15()
+    val want: [20]i16 = [2916, -5012, 8314, 9938, -3397, 11835, 3032, -3388, 11392, 174, -14791, -3507, -7863,
+        -2969, 24359, -4252, -16512, 17468, -12020, 3858]
+    var t = taps15
+    var x = x15
+    var line: [14]q15 = [0.0; 14]
+    var out: [20]q15 = [0.0; 20]
+    val made: Result[Fir[q15], Fault] = Fir.of(q15::Bits(t[..]), line[..])
+    var f = made.unwrap()
+
+    f.process(q15::Bits(x[..]), out[..])
+
+    for i in 0..<20
+        assert(out[i].bits == want[i], f"sample $i: ${out[i].bits}")
+end fir_q15
+
+@test("q31 FIR output is the exact convolution rounded, bit for bit")
+fir_q31()
+    var t: [7]i32 = [214792026, -429508834, 644274263, 536881411, -322053247, 107388111, -161079971]
+    var x: [20]i32 = [1910886659, 537283987, 791041907, 1705985862, 336246831, 1184055615, 1433075086,
+        -1180208656, -1908966809, -858291926, -923101919, 1604423090, 1772192363, -2124808487, -864573, 1379715819,
+        -1582910651, 1275895623, -1636018355, -137691860]
+    val want: [20]i32 = [191127517, -328448780, 544952400, 651343932, -222499662, 775743115, 198806059, -221958414,
+        746623728, 11435227, -969365639, -229807973, -515386464, -194622490, 1596387063, -278635503, -1082045505,
+        1144852010, -787834814, 252914576]
+    var line: [14]q31 = [0.0; 14]
+    var out: [20]q31 = [0.0; 20]
+    val made: Result[Fir[q31], Fault] = Fir.of(q31::Bits(t[..]), line[..])
+    var f = made.unwrap()
+
+    f.process(q31::Bits(x[..]), out[..])
+
+    for i in 0..<20
+        assert(out[i].bits == want[i], f"sample $i: ${out[i].bits}")
+end fir_q31
+
+@test("f32 FIR output is numpy's convolution")
+fir_f32()
+    val want: [20]real = [0.088985533, -0.152951229, 0.253726736, 0.303273360, -0.103653132, 0.361177796,
+        0.092530608, -0.103399228, 0.347643779, 0.005317699, -0.451390693, -0.107011143, -0.239971519,
+        -0.090614513, 0.743376773, -0.129755228, -0.503899111, 0.533094936, -0.366832109, 0.117746085]
+    var t: [7]f32 = [0.0; 7]
+    var x: [20]f32 = [0.0; 20]
+
+    for i in 0..<7 do t[i] = f32(taps15[i]) / 32768.0
+    for i in 0..<20 do x[i] = f32(x15[i]) / 32768.0
+
+    var line: [14]f32 = [0.0; 14]
+    var out: [20]f32 = [0.0; 20]
+    val made: Result[Fir[f32], Fault] = Fir.of(t[..], line[..])
+    var f = made.unwrap()
+
+    f.process(x[..], out[..])
+
+    for i in 0..<20
+        assert(near(real(out[i]), want[i], 0.000001), f"sample $i")
+end fir_f32
+
+@test("FIR taps at the ends of q15 saturate rather than wrap, and a one-tap filter is a gain")
+fir_limits()
+    val lo: [1]q15 = [q15::Min]
+    var line: [2]q15 = [0.0; 2]
+    val made: Result[Fir[q15], Fault] = Fir.of(lo[..], line[..])
+    var f = made.unwrap()
+
+    assert(f.step(q15::Min) == q15::Max, "-1 times -1 is the largest value, not -1")
+    assert(f.step(q15::Max).bits == -32767, "-1 times the largest value")
+
+    val hi: [2]q15 = [q15::Max, q15::Max]
+    var line2: [4]q15 = [0.0; 4]
+    val made2: Result[Fir[q15], Fault] = Fir.of(hi[..], line2[..])
+    var g = made2.unwrap()
+
+    g.step(q15::Max)
+    assert(g.step(q15::Max) == q15::Max, "a sum near 2 saturates")
+end fir_limits
+
+@test("an FIR's storage must be twice its taps, and it must have some")
+fir_refusals()
+    val t: [3]q15 = [0.25, 0.5, 0.25]
+    var short: [5]q15 = [0.0; 5]
+    val none: [0]q15 = []
+    var empty: [0]q15 = []
+    val a: Result[Fir[q15], Fault] = Fir.of(t[..], short[..])
+    val b: Result[Fir[q15], Fault] = Fir.of(none[..], empty[..])
+
+    assert(refused(a, BadStorage) && refused(b, BadStorage), "both refused")
+
+// -- gain and mix ----------------------------------------------------------------------------------
+
+@test("q15 gain and mix clip exactly at 0x7FFF and -0x8000, never wrapping")
+q15_saturation()
+    val xs: [4]q15 = [0.75, -0.75, q15::Min, 0.25]
+    var out: [4]q15 = [0.0; 4]
+    val two: Result[Gain[q15], Fault] = Gain.of(2.0)
+    var g = two.unwrap()
+
+    g.process(xs[..], out[..])
+    assert(out[0].bits == 0x7FFF && out[1].bits == -0x8000 && out[3] == q15(0.5), "doubled, clipped")
+
+    val inv: Result[Gain[q15], Fault] = Gain.of(-1.0)
+    var n = inv.unwrap()
+
+    n.process(xs[..], out[..])
+    assert(out[2].bits == 0x7FFF, "inverting -1 gives the largest value, not -1 again")
+
+    val a: [3]q15 = [0.75, -0.75, 0.5]
+    val b: [3]q15 = [0.75, -0.75, -0.25]
+    var m: [3]q15 = [0.0; 3]
+
+    mix(a[..], b[..], m[..])
+    assert(m[0].bits == 0x7FFF && m[1].bits == -0x8000 && m[2] == q15(0.25), "mixed, clipped")
+end q15_saturation
+
+@test("gain and mix clip at full scale for q31 and f32 too")
+other_saturation()
+    val a: [2]q31 = [0.75, -0.75]
+    var m: [2]q31 = [0.0; 2]
+
+    mix(a[..], a[..], m[..])
+    assert(m[0] == q31::Max && m[1] == q31::Min, "q31")
+
+    val f: [3]f32 = [0.75, -0.75, 0.25]
+    var o: [3]f32 = [0.0; 3]
+    val half: Result[Gain[f32], Fault] = Gain.db(-6.020599913279624)
+    val two: Result[Gain[f32], Fault] = Gain.of(2.0)
+
+    mix_with(f[..], two.unwrap(), f[..], half.unwrap(), o[..])
+    assert(o[0] == 1.0 && o[1] == -1.0 && near(real(o[2]), 0.625, 0.000001), "f32 clamps to -1..1")
+end other_saturation
+
+@test("a gain must be one the coefficient type holds")
+gain_range()
+    val a: Result[Gain[q15], Fault] = Gain.of(8.0)
+    val b: Result[Gain[q15], Fault] = Gain.of(7.99)
+    val c: Result[Gain[q15], Fault] = Gain.of(-8.0)
+    val d: Result[Gain[f32], Fault] = Gain.of(100.0)
+
+    assert(refused(a, CoefficientRange) && b.is_ok() && c.is_ok() && d.is_ok(), "-8 up to just under 8")
+
+// -- oscillator ------------------------------------------------------------------------------------
+
+private rising_crossings[S: Sample](shape: Shape, freq: real, n: int) -> int
+    val made: Result[Oscillator[S], Fault] = Oscillator.of(shape, freq, fs)
+    var o = made.unwrap()
+    var prev = o.next()
+    var count = 0
+
+    for _ in 1..<n
+        val y = o.next()
+
+        if prev < S.zero() && y >= S.zero() then count += 1
+        prev = y
+
+    count
+end rising_crossings
+
+@test("an oscillator's frequency is its count of rising zero crossings, for every shape and type")
+oscillator_frequency()
+    val shapes: [4]Shape = [Sine, Saw, Square, Triangle]
+
+    for s in shapes
+        // 750 Hz is 1/64 of the rate, exact in the phase: 750 crossings in a second and one sample.
+        assert(rising_crossings[q15](s, 750.0, 48001) == 750, "q15 at 750")
+        assert(rising_crossings[q31](s, 750.0, 48001) == 750, "q31 at 750")
+        assert(rising_crossings[f32](s, 750.0, 48001) == 750, "f32 at 750")
+
+        val c = rising_crossings[q15](s, 1000.0, 48000)
+        assert(c == 999 || c == 1000, f"q15 at 1000: $c")
+end oscillator_frequency
+
+@test("each shape starts where it should, and the phase wraps without a trace")
+oscillator_shapes()
+    val sine: Result[Oscillator[q31], Fault] = Oscillator.of(Sine, 12000.0, fs)
+    val saw: Result[Oscillator[q31], Fault] = Oscillator.of(Saw, 12000.0, fs)
+    val sq: Result[Oscillator[q31], Fault] = Oscillator.of(Square, 12000.0, fs)
+    val tri: Result[Oscillator[q31], Fault] = Oscillator.of(Triangle, 12000.0, fs)
+    var s = sine.unwrap()
+    var w = saw.unwrap()
+    var q = sq.unwrap()
+    var t = tri.unwrap()
+
+    // A quarter cycle per sample: phases 0, 1/4, 1/2, 3/4, then 0 again.
+    assert(s.next() == q31(0.0) && s.next() == q31(q15::Max) && s.next() == q31(0.0), "sine")
+    assert(s.next() == q31(q15::Min) && s.next() == q31(0.0), "sine wraps")
+    assert(w.next() == q31::Min && w.next() == q31(-0.5) && w.next() == q31(0.0) && w.next() == q31(0.5), "saw")
+    assert(q.next() == q31::Max && q.next() == q31::Max && q.next() == q31::Min && q.next() == q31::Min, "square")
+    assert(t.next() == q31::Min && t.next() == q31(0.0) && t.next() == q31::Max && t.next() == q31(0.0), "triangle")
+end oscillator_shapes
+
+@test("the sine's harmonic distortion is below -80 dB, measured with sh.sysl.fft")
+oscillator_thd()
+    // Bin 15 of 1024: an exact phase step that is not a whole number of table entries, so every
+    // sample interpolates.
+    val made: Result[Oscillator[f32], Fault] = Oscillator.of(Sine, 15.0 * fs / 1024.0, fs)
+    var o = made.unwrap()
+    var xs: [1024]f32 = [0.0; 1024]
+    var spectrum: [1024]Complex[real] = [Complex(0.0, 0.0); 1024]
+
+    o.process(xs[..])
+    windowed(Rectangular, xs[..], spectrum[..])
+    fft(spectrum[..]).unwrap()
+
+    val power = (k: int) -> spectrum[k].re * spectrum[k].re + spectrum[k].im * spectrum[k].im
+    var harmonics = 0.0
+
+    for h in 2..<34
+        harmonics += power(15 * h)
+
+    val thd = (harmonics / power(15)).sqrt()
+
+    assert(dbfs(thd) < -80.0, f"THD ${dbfs(thd)} dB")
+end oscillator_thd
+
+@test("an oscillator at or past Nyquist, or below zero, is refused")
+oscillator_refusals()
+    val a: Result[Oscillator[q15], Fault] = Oscillator.of(Sine, 24000.0, fs)
+    val b: Result[Oscillator[q15], Fault] = Oscillator.of(Sine, -1.0, fs)
+    val c: Result[Oscillator[q15], Fault] = Oscillator.of(Sine, 0.0, fs)
+
+    assert(refused(a, BadFrequency) && refused(b, BadFrequency) && c.is_ok(), "0 <= f < rate / 2")
+
+// -- envelope --------------------------------------------------------------------------------------
+
+@test("each envelope stage ends on exactly the sample it was given")
+envelope_timing()
+    val made: Result[Adsr[q31], Fault] = Adsr.of(4, 3, 0.5, 5)
+    var e = made.unwrap()
+
+    assert(e.next() == q31(0.0) && e.stage() == Idle, "silent before the key")
+
+    e.gate_on()
+    val a: [4]q31 = [e.next(), e.next(), e.next(), e.next()]
+
+    assert(a[0] == q31::Bits(536870911) && a[2] < q31::Max && a[3] == q31::Max, "attack: full scale on its 4th")
+    assert(e.stage() == Decay, "and the decay begins")
+
+    val d: [3]q31 = [e.next(), e.next(), e.next()]
+
+    assert(d[1] > q31(0.5) && d[2] == q31(0.5) && e.stage() == Sustain, "decay: the sustain level on its 3rd")
+
+    for _ in 0..<10
+        assert(e.next() == q31(0.5), "held")
+
+    e.gate_off()
+    val r: [5]q31 = [e.next(), e.next(), e.next(), e.next(), e.next()]
+
+    assert(near(real(r[0]), 0.4, 0.000000001) && r[3] > q31(0.0) && r[4] == q31(0.0) && e.stage() == Idle, "release: zero on its 5th")
+end envelope_timing
+
+@test("a stage of no length is skipped, and a release mid-attack starts where the level is")
+envelope_edges()
+    val made: Result[Adsr[q15], Fault] = Adsr.of(0, 0, 0.25, 2)
+    var e = made.unwrap()
+
+    e.gate_on()
+    assert(e.stage() == Sustain && e.next() == q15(0.25), "straight to the sustain")
+
+    val slow: Result[Adsr[f32], Fault] = Adsr.of(4, 0, 1.0, 2)
+    var s = slow.unwrap()
+
+    s.gate_on()
+    s.next()
+    s.next()
+    s.gate_off()
+    assert(near(real(s.next()), 0.25, 0.000001) && s.next() == 0.0, "from half-way down in two")
+
+    val bad: Result[Adsr[q15], Fault] = Adsr.of(-1, 0, 0.5, 0)
+    val loud: Result[Adsr[q15], Fault] = Adsr.of(1, 1, 1.5, 1)
+
+    assert(refused(bad, BadParameter) && refused(loud, BadParameter), "refused")
+end envelope_edges
+
+@test("an envelope shapes a block it is applied to")
+envelope_process()
+    val made: Result[Adsr[q15], Fault] = Adsr.of(2, 0, 1.0, 1)
+    var e = made.unwrap()
+    val xs: [3]q15 = [0.5, 0.5, 0.5]
+    var out: [3]q15 = [0.0; 3]
+
+    e.gate_on()
+    e.process(xs[..], out[..])
+    assert(out[0] == q15(0.25) && out[1].bits == 16384 && out[2] == out[1], "ramped (the product half-up), then held")
+
+// -- meters ----------------------------------------------------------------------------------------
+
+@test("RMS and peak meet their closed forms")
+meters()
+    var sine: [4800]q31 = [0.0; 4800]
+
+    for n in 0..<4800 do sine[n] = q31(wave(n, 1000.0, 0.5))
+
+    assert(near(rms(sine[..]), 0.5 / 2.0.sqrt(), 0.000000001), "a sine's RMS is its amplitude over root 2")
+    assert(peak(sine[..]) == q31(0.5), "and its peak is its amplitude")
+
+    val dc: [3]f32 = [-0.25, -0.25, -0.25]
+    val square: [4]q15 = [0.25, -0.25, 0.25, -0.25]
+
+    assert(rms(dc[..]) == 0.25 && peak(dc[..]) == 0.25, "DC")
+    assert(rms(square[..]) == 0.25 && peak(square[..]) == q15(0.25), "a square wave")
+
+    val none: [0]q15 = []
+    val lowest: [1]q15 = [q15::Min]
+
+    assert(rms(none[..]) == 0.0 && peak(none[..]) == q15(0.0), "no samples")
+    assert(peak(lowest[..]) == q15::Max && rms(lowest[..]) == 1.0, "-1 alone")
+    assert(dbfs(0.5) < -6.02 && dbfs(0.5) > -6.03, "half scale")
+end meters
+
+// -- windows ---------------------------------------------------------------------------------------
+
+@test("the windows are numpy's hanning and hamming")
+windows()
+    val hann: [8]real = [0.0, 0.188255099070633, 0.611260466978157, 0.950484433951210, 0.950484433951210,
+        0.611260466978157, 0.188255099070633, 0.0]
+    val hamming: [8]real = [0.08, 0.253194691144983, 0.642359629619905, 0.954445679235113, 0.954445679235113,
+        0.642359629619905, 0.253194691144983, 0.08]
+
+    for n in 0..<hann.len
+        assert(near(window_at(Hann, n, 8), hann[n], 0.000000000001), f"hann $n")
+        assert(near(window_at(Hamming, n, 8), hamming[n], 0.000000000001), f"hamming $n")
+        assert(window_at(Rectangular, n, 8) == 1.0, "rectangular")
+
+    assert(window_at(Hann, 0, 1) == 1.0, "a window of one")
+end windows
+
+@test("a windowed q15 sine transforms to its bin, with Hann's half-height neighbours")
+into_fft()
+    val made: Result[Oscillator[q15], Fault] = Oscillator.of(Sine, 32.0 * fs / 256.0, fs)
+    var o = made.unwrap()
+    var xs: [256]q15 = [0.0; 256]
+    var spectrum: [256]Complex[f32] = [Complex(f32(0.0), f32(0.0)); 256]
+
+    o.process(xs[..])
+    windowed(Hann, xs[..], spectrum[..])
+    fft(spectrum[..]).unwrap()
+
+    val mag = (k: usize) -> real((spectrum[k].re * spectrum[k].re + spectrum[k].im * spectrum[k].im).sqrt())
+
+    assert(mag(32) > mag(31) && mag(32) > mag(33) && mag(32) > 60.0, f"the peak is bin 32: ${mag(32)}")
+    assert(near(mag(31) / mag(32), 0.5, 0.01) && near(mag(33) / mag(32), 0.5, 0.01), "neighbours at half")
+    assert(mag(40) < 0.01 * mag(32), "and little anywhere else")
+end into_fft
+
+// -- the README ------------------------------------------------------------------------------------
+
+// The README's example, as it is written there, inside a function so that its `?` has somewhere to go.
+private readme_example() -> Result[q15, Fault]
+    val osc: Result[Oscillator[q15], Fault] = Oscillator.of(Sine, 440.0, 48000.0)
+    val lp: Result[Biquad[q15], Fault] = Biquad.of(low_pass(1000.0, 48000.0, 0.7071)?)
+
+    var o = osc?
+    var f = lp?
+    var block: [64]q15 = [q15(0.0); 64]
+
+    o.process(block[..])
+    f.process_in_place(block[..])
+
+    Ok(block[63])
+end readme_example
+
+@test("the README's example builds and runs")
+readme()
+    assert(readme_example().is_ok(), "the example's blocks were all built")

@@ -1,0 +1,38 @@
+module sh.sysl.dsp
+
+import sysl.math.Float
+
+// Level meters over a block of samples.
+
+/** The largest magnitude in `xs`, or zero for no samples. */
+@no_alloc
+peak[S: Sample](xs: []const S) -> S
+    var m = S.zero()
+
+    for x in xs
+        val a = x.level()
+
+        if a > m then m = a
+
+    m
+end peak
+
+/** The root mean square of `xs` as a `real`, or zero for no samples. The squares are summed in
+ * `real`, which holds a `q31`'s square exactly and does not overflow over any block a program has.
+ */
+@no_alloc
+rms[S: Sample](xs: []const S) -> real
+    if xs.len == 0 then return 0.0
+
+    var sum = 0.0
+
+    for x in xs
+        val v = x.to_real()
+
+        sum += v * v
+
+    (sum / real(xs.len)).sqrt()
+end rms
+
+/** A level in decibels relative to full scale: `20 log10(level)`. */
+dbfs(level: real) -> real = 20.0 * level.log10()

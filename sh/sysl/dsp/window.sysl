@@ -1,0 +1,37 @@
+module sh.sysl.dsp
+
+import sysl.math.Float
+import sysl.math.complex.Complex
+
+// The way into a spectrum: a block of samples, windowed, as the complex values `sh.sysl.fft` takes.
+//
+// The windows are the symmetric ones numpy's `hanning` and `hamming` compute, and nothing here
+// allocates -- the caller supplies the complex buffer, which is what `fft` then transforms in place.
+
+/** A window applied before a transform. */
+enum Window
+    Rectangular
+    Hann
+    Hamming
+
+/** The window's `n`th weight of `len`: symmetric, so the first and last are equal. A window of one
+ * weight is 1.
+ */
+window_at(w: Window, n: usize, len: usize) -> real
+    if len <= 1 then return 1.0
+
+    val c = (2.0 * real.pi() * real(n) / real(len - 1)).cos()
+
+    w match
+        Rectangular -> 1.0
+        Hann -> 0.5 - 0.5 * c
+        Hamming -> 0.54 - 0.46 * c
+end window_at
+
+/** `xs` weighted by `w`, as complex values with no imaginary part, into the first `xs.len` entries
+ * of `out` -- ready for `sh.sysl.fft.fft`.
+ */
+@no_alloc
+windowed[S: Sample, F: Float](w: Window, xs: []const S, out: []Complex[F])
+    for i in 0..<xs.len
+        out[i] = Complex(F(xs[i].to_real() * window_at(w, i, xs.len)), F.zero())

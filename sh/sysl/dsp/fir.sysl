@@ -1,0 +1,46 @@
+module sh.sysl.dsp
+
+// A finite impulse response filter over a circular delay line the caller supplies.
+//
+// **The line is twice the length of the taps, and each sample is written into both halves.** The
+// most recent `taps.len` samples then always sit in one contiguous run of it, newest first, so the
+// sum of products is one `S.dot` over two slices of equal length -- which for `q15` is the pairwise
+// `SMLAD` loop -- and never a modulo per tap.
+
+/** An FIR filter: `y[n] = Σ taps[k] * x[n - k]`. */
+struct Fir[S: Sample]
+    taps: []const S
+    line: []S
+    pos: usize
+
+    /** A filter over `taps`, its delay line in `line`, which must be exactly `2 * taps.len` long
+     * (`BadStorage` otherwise, and for no taps at all). The line is cleared.
+     */
+    of(taps: []const S, line: []S) -> Result[Fir[S], Fault]
+        if taps.len == 0 || line.len != 2 * taps.len then return Err(BadStorage)
+
+        for i in 0..<line.len
+            line[i] = S.zero()
+
+        Ok(Fir(taps, line, 0))
+    end of
+
+    /** The filter's response to one sample. */
+    @no_alloc
+    step(*self, x: S) -> S
+        val n = self.taps.len
+
+        if self.pos == 0 then self.pos = n
+        self.pos -= 1
+        self.line[self.pos] = x
+        self.line[self.pos + n] = x
+
+        S.dot(self.taps, self.line[self.pos..<self.pos + n])
+    end step
+
+    /** Filters `input` into the first `input.len` samples of `out`. */
+    @no_alloc
+    process(*self, input: []const S, out: []S)
+        for i in 0..<input.len
+            out[i] = self.step(input[i])
+end Fir
