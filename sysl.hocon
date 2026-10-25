@@ -20,13 +20,13 @@ package {
   // Fixed point with `wrapping` accumulators, the `Signed` conformance a fixed-point `abs` comes
   // from, lanes whose dot product lowers to `SMLAD`, and `const` functions that build a whole table
   // all arrived by 0.1.0-alpha.12.
-  sysl = "0.1.0-alpha.12"
+  sysl = "0.6.0"
 }
 
 // `fft` is here for the test suite only, which transforms a windowed block to check the path into
 // it; the package's own files import nothing from it.
 dependencies {
-  fft { git = "github.com/sysl-lang/fft", version = "0.1.0" }
+  fft { git = "github.com/sysl-lang/fft", version = "0.1.1" }
 }
 
 // **No `heap`.** Every block keeps its state in its own fields, and anything longer -- an FIR's

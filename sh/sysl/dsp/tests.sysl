@@ -64,7 +64,7 @@ design_refusals()
     assert(refused(high_pass(-5.0, fs, 0.7), BadFrequency), "a negative frequency")
     assert(refused(peaking(1000.0, fs, 0.0, 6.0), BadParameter), "Q of zero")
     assert(refused(notch(1000.0, 0.0, 1.0), BadParameter), "no sample rate")
-    assert(str(BadFrequency) == "the frequency is not between zero and half the sample rate", "the rendering")
+    assert(BadFrequency.to_string() == "the frequency is not between zero and half the sample rate", "the rendering")
 
 @test("a coefficient past 8 is refused at fixed point and taken at f32")
 coefficient_range()

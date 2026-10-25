@@ -17,7 +17,7 @@ sh/sysl/dsp/
     window.sysl       Hann and Hamming, into the complex buffer fft transforms
     fault.sysl        what a construction refuses
     tests.sysl        what all of it claims, run by `sysl test .`
-package.hocon         who this package is, and what it needs of the machine
+sysl.hocon            who this package is, and what it needs of the machine
 ```
 
 The module is **`sh.sysl.dsp`**. It needs no heap: every block keeps its state in its own fields,
