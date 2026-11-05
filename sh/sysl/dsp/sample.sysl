@@ -40,7 +40,7 @@ type Dot31 = new i64q62 wrapping
  * `Coef` is a coefficient or a gain -- for the fixed-point samples an `i32q28`, which holds -8 up to
  * just under 8 -- and `Acc` is where a coefficient times a sample is summed without rounding.
  */
-trait Sample: Zero + Add + Sub + Mul + Neg + Ord + Eq
+trait Sample: Zero + Add + Sub + Mul + Neg + PartialOrd + Eq
     type Coef
     type Acc: Add
 

@@ -28,7 +28,7 @@ passes in.
 
 ```
 dependencies {
-  dsp { git = "github.com/sysl-lang/dsp", version = "0.1.0" }
+  dsp { git = "github.com/sysl-lang/dsp", version = "0.1.1" }
 }
 ```
 

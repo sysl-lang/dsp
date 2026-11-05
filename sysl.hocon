@@ -8,19 +8,19 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       dsp { git = "github.com/sysl-lang/dsp", version = "0.1.0" }
+//       dsp { git = "github.com/sysl-lang/dsp", version = "0.1.1" }
 //     }
 //
 // The coordinate names the package, `dsp`; the module a program imports is `sh.sysl.dsp`.
 
 package {
   name    = "dsp"
-  version = "0.1.0"
+  version = "0.1.1"
 
   // Fixed point with `wrapping` accumulators, the `Signed` conformance a fixed-point `abs` comes
   // from, lanes whose dot product lowers to `SMLAD`, and `const` functions that build a whole table
   // all arrived by 0.1.0-alpha.12.
-  sysl = "0.6.0"
+  sysl = "0.9.0"
 }
 
 // `fft` is here for the test suite only, which transforms a windowed block to check the path into
